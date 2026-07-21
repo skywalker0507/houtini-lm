@@ -34,7 +34,8 @@ import {
   fitPrefillLinear,
   type PromptHints,
 } from './model-cache.js';
-import { access, readFile, realpath, writeFile } from 'node:fs/promises';
+import { acquireInferenceLock } from './inference-lock.js';
+import { access, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { isAbsolute, basename, dirname, relative, resolve, sep } from 'node:path';
 
@@ -254,6 +255,44 @@ async function resolveAllowedOutputPath(outputPath: string): Promise<{ path?: st
   return allowed
     ? { path: target }
     : { error: `Security: output_path is outside HOUTINI_LM_ALLOWED_ROOTS: ${target}` };
+}
+
+const MAX_FILE_BYTES = Math.max(
+  1,
+  parseInt(process.env.HOUTINI_LM_MAX_FILE_MB || '10', 10),
+) * 1024 * 1024;
+
+async function readGuardedFile(path: string): Promise<string> {
+  const violation = await validateAllowedPaths([path]);
+  if (violation) throw new Error(violation);
+  const real = await realpath(path);
+  const info = await stat(real);
+  if (!info.isFile()) throw new Error('not a regular file');
+  if (info.size > MAX_FILE_BYTES) {
+    throw new Error(`file is ${(info.size / 1024 / 1024).toFixed(1)} MB, over the ${(MAX_FILE_BYTES / 1024 / 1024).toFixed(0)} MB limit`);
+  }
+  return readFile(real, 'utf8');
+}
+
+function redactUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    let changed = false;
+    if (url.username || url.password) {
+      url.username = '';
+      url.password = '';
+      changed = true;
+    }
+    for (const key of ['api_key', 'apikey', 'key', 'token', 'password', 'access_token']) {
+      if (url.searchParams.has(key)) {
+        url.searchParams.set(key, '***');
+        changed = true;
+      }
+    }
+    return changed ? url.toString() : raw;
+  } catch {
+    return raw;
+  }
 }
 
 // ── Session-level token accounting ───────────────────────────────────
@@ -574,6 +613,7 @@ interface CompletionOptions {
   responseFormat?: ResponseFormat;
   progressToken?: string | number;
   thinking?: 'disabled' | 'enabled' | 'auto';
+  sampling?: SamplingParams;
 }
 
 interface ModelInfo {
@@ -1099,19 +1139,11 @@ async function chatCompletionStreamingInner(
   // generating huge responses that would eat into the orchestrator's context window.
   // The global cap is enforced even when a caller supplies max_tokens. Operators
   // can raise the cap explicitly, but one tool call cannot silently bypass it.
-  let effectiveMaxTokens = Math.min(options.maxTokens ?? DEFAULT_MAX_TOKENS, HOUTINI_LM_AUTO_MAX_TOKENS);
-  if (!options.maxTokens) {
-    const activeModel = await resolveActive();
-    if (activeModel) {
-      const ctx = getContextLength(activeModel);
-      const pctBased = Math.floor(ctx * 0.25);
-      effectiveMaxTokens = Math.min(pctBased, HOUTINI_LM_AUTO_MAX_TOKENS);
-    }
-  }
-  let effectiveMaxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
-  if (!options.maxTokens && contextLen) {
-    effectiveMaxTokens = Math.floor(contextLen * 0.25);
-  }
+  const activeModel = await resolveActive();
+  const contextLen = activeModel ? getContextLength(activeModel) : undefined;
+  const requestedMaxTokens = options.maxTokens
+    ?? (contextLen ? Math.floor(contextLen * 0.25) : DEFAULT_MAX_TOKENS);
+  let effectiveMaxTokens = Math.min(requestedMaxTokens, HOUTINI_LM_AUTO_MAX_TOKENS);
 
   // Never request more output than the context window can hold alongside the
   // prompt — vLLM (and strict OpenAI backends) reject prompt+max_tokens >
@@ -2271,6 +2303,16 @@ const DELEGATE_TOOL = {
   },
 };
 
+const SAMPLING_PROPS = {
+  seed: { type: 'integer', description: 'Deterministic sampling seed.' },
+  stop: { type: ['string', 'array'], items: { type: 'string' }, description: 'Stop sequence(s), up to 4.' },
+  top_p: { type: 'number', description: 'Nucleus sampling from 0 to 1.' },
+  top_k: { type: 'integer', description: 'Sample only from the top-K tokens.' },
+  repeat_penalty: { type: 'number', description: 'Repetition penalty from 0 to 2.' },
+  frequency_penalty: { type: 'number', description: 'Frequency penalty from -2 to 2.' },
+  presence_penalty: { type: 'number', description: 'Presence penalty from -2 to 2.' },
+} as const;
+
 const TOOLS = [
   {
     name: 'chat',
@@ -2567,7 +2609,7 @@ function buildSidekickInstructions(): string {
 const SIDEKICK_INSTRUCTIONS = buildSidekickInstructions();
 
 const server = new Server(
-  { name: 'houtini-lm', version: '2.14.1' },
+  { name: 'houtini-lm', version: '3.2.0-pcb-ai' },
   { capabilities: { tools: {}, resources: {} }, instructions: SIDEKICK_INSTRUCTIONS },
 );
 

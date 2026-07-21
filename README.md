@@ -1,4 +1,4 @@
-# @houtini/lm Houtini LM - Save Tokens by Offloading Tasks from Claude Code to Your Local LLM Server (LM Studio / Ollama), Openrouter or a Cloud API
+# @houtini/lm Houtini LM - Delegate Tasks to a Sidekick LLM (LM Studio / Ollama / OpenRouter / DeepSeek / Any OpenAI-Compatible API)
 
 [![npm version](https://img.shields.io/npm/v/@houtini/lm.svg?style=flat-square)](https://www.npmjs.com/package/@houtini/lm)
 [![MCP Registry](https://img.shields.io/badge/MCP-Registry-blue?style=flat-square)](https://registry.modelcontextprotocol.io)
@@ -14,20 +14,20 @@
 >
 > [How it works](#how-it-works) | [Quick start](#quick-start) | [What gets offloaded](#what-gets-offloaded) | [Tools](#tools) | [Performance tracking](#performance-tracking) | [Structured JSON output](#structured-json-output) | [Model routing](#model-routing) | [Self-test (shakedown)](#self-test-shakedown) | [Configuration](#configuration) | [Compatible endpoints](#compatible-endpoints) | [Developer guide](./DEVELOPER.md)
 
-I built this because I kept leaving Claude Code running overnight on big refactors and the token bill was painful. A huge chunk of that spend goes on bounded tasks any decent model handles fine - generating boilerplate, code review, commit messages, format conversion. Stuff that doesn't need Claude's reasoning or tool access.
+I built this because AI coding agents burn through tokens fast on tasks any decent model handles fine — generating boilerplate, code review, commit messages, format conversion. Stuff that doesn't need frontier-model reasoning or tool access.
 
-Houtini LM connects Claude Code to a local LLM on your network - or any OpenAI-compatible API (LM Studio, Ollama, vLLM, DeepSeek, Groq, Cerebras, and OpenRouter's 300+ models through one endpoint). Claude keeps doing the hard work - architecture, planning, multi-file changes - and offloads the grunt work to whatever cheaper model you've got running. No Claude quota burn. No rate limits. Private if local, cheap if cloud. The trade is wall-clock time: local inference is typically 3-30× slower than frontier models, so delegation wins on bounded, self-contained tasks rather than everything.
+Houtini LM connects your orchestrator (Claude Code, Codex CLI, whatever MCP client you run) to a sidekick LLM — a local model on your network, or any OpenAI-compatible API. Your orchestrator keeps architecture, planning, decisions, and verification, while the sidekick handles bounded execution. The strongest context savings come from path-based delegation, where source files go directly to the sidekick instead of first entering the orchestrator context.
 
 I wrote a [full walkthrough of why I built this and how I use it day to day](https://houtini.com/how-to-cut-your-claude-code-bill-with-houtini-lm/).
 
 ## How it works
 
 ```
-Claude Code (orchestrator)
+Your MCP Client (Claude Code / Codex CLI / VS Code)
    |
-   |-- Complex reasoning, planning, architecture --> Claude API (your tokens)
+   |-- Complex reasoning, planning, architecture --> Primary API (your tokens)
    |
-   +-- Bounded grunt work --> houtini-lm --HTTP/SSE--> Your local LLM (free)
+   +-- Bounded grunt work --> houtini-lm --HTTP/SSE--> Your sidekick LLM (cheap/free)
        . Boilerplate & test stubs          Qwen, Llama, Nemotron, GLM...
        . Code review & explanations        LM Studio, Ollama, vLLM, llama.cpp
        . Commit messages & docs            DeepSeek, Groq, Cerebras (cloud)
@@ -36,7 +36,7 @@ Claude Code (orchestrator)
        . Embeddings for RAG pipelines
 ```
 
-Claude's the architect. Your local model's the drafter. Claude QAs everything.
+Your orchestrator's the architect. Your sidekick model's the drafter. Review everything.
 
 ## Quick start
 
@@ -46,7 +46,55 @@ Claude's the architect. Your local model's the drafter. Claude QAs everything.
 claude mcp add houtini-lm -- npx -y @houtini/lm
 ```
 
-That's it. If LM Studio's running on `localhost:1234` (the default), Claude can start delegating straight away.
+That's it. If LM Studio's running on `localhost:1234` (the default), your orchestrator can start delegating straight away.
+
+### Codex CLI
+
+```bash
+codex mcp add houtini-lm -- npx -y @houtini/lm
+```
+
+Works the same way as Claude Code. Point it at DeepSeek or any other OpenAI-compatible API:
+
+```bash
+codex mcp add houtini-lm \
+  --env HOUTINI_LM_ENDPOINT_URL=https://api.deepseek.com \
+  --env HOUTINI_LM_API_KEY=sk-your-deepseek-key \
+  --env HOUTINI_LM_MODEL=deepseek-v4-flash \
+  --env HOUTINI_LM_ORCHESTRATOR=codex \
+  -- npx -y @houtini/lm
+```
+
+### VS Code Codex
+
+Add to `~/.codex/config.toml` (shared between the Codex CLI and VS Code extension):
+
+```toml
+[mcp_servers.houtini-lm]
+command = "npx"
+args = ["-y", "@houtini/lm"]
+tool_timeout_sec = 120
+enabled_tools = ["delegate"]
+# Forward this from the environment instead of storing the key in TOML:
+env_vars = ["HOUTINI_LM_API_KEY"]
+
+[mcp_servers.houtini-lm.env]
+HOUTINI_LM_ENDPOINT_URL = "https://api.deepseek.com"
+HOUTINI_LM_PROVIDER = "deepseek"
+HOUTINI_LM_MODEL = "deepseek-v4-flash"
+HOUTINI_LM_ORCHESTRATOR = "codex"
+HOUTINI_LM_DEEPSEEK_THINKING = "disabled"
+HOUTINI_LM_AUTO_MAX_TOKENS = "1800"
+HOUTINI_LM_RESPONSE_METADATA = "none"
+# Windows example; set this to the projects the MCP may read:
+HOUTINI_LM_ALLOWED_ROOTS = "D:\\projects"
+```
+
+> **Codex timeout note**: The default `tool_timeout_sec` in Codex is 60s. If using slower local models, raise it in `~/.codex/config.toml`:
+> ```toml
+> [mcp_servers.houtini-lm]
+> tool_timeout_sec = 300
+> ```
 
 ### LLM on a different machine
 
@@ -144,7 +192,7 @@ For models we know well - Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS - there's
 | Text embeddings | Semantic search, RAG pipelines |
 | Brainstorm approaches | Doesn't commit to anything |
 
-**Keep on Claude** - anything that needs reasoning, tool access, or multi-step orchestration:
+**Keep on the primary/orchestrator model** - anything that needs reasoning, tool access, or multi-step orchestration:
 
 - Architectural decisions
 - Reading/writing files
@@ -152,7 +200,7 @@ For models we know well - Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS - there's
 - Multi-file refactoring plans
 - Anything that needs to call other tools
 
-The tool descriptions are written to nudge Claude into planning delegation at the start of large tasks, not just using it when it happens to think of it.
+The tool descriptions are written to nudge the orchestrator into planning delegation at the start of large tasks, not just using it when it happens to think of it.
 
 ## Performance tracking
 
@@ -162,7 +210,7 @@ Every response includes a footer with real performance data — computed from th
 ---
 Model: nvidia/nemotron-3-nano | 279→303 tokens (12 reasoning / 291 visible) | TTFT: 485ms, 58.0 tok/s, 5.2s
 📊 First measured call on nvidia/nemotron-3-nano: 58.0 tok/s, 485ms to first token — use this to gauge whether to delegate longer tasks.
-💰 Claude quota saved — this session: 4,283 tokens / 7 calls · lifetime: 147,432 tokens / 213 calls
+🤖 Sidekick tokens processed — this session: 4,283 tokens / 7 calls · lifetime: 147,432 tokens / 213 calls
 ```
 
 The 📊 line only appears on the first measured call per model per session — it's a real benchmark from a genuine task, not a synthetic warmup. The 💰 line updates every call.
@@ -171,7 +219,7 @@ When the active model returns `completion_tokens_details.reasoning_tokens` (Deep
 
 ### Lifetime persistence
 
-Per-model performance and token counts persist across Claude Desktop restarts in `~/.houtini-lm/model-cache.db`. This means:
+Per-model performance and token counts persist across orchestrator restarts in `~/.houtini-lm/model-cache.db`. This means:
 
 - From call 1 of a new session, `discover` shows **historical** tok/s and TTFT for the loaded model — not "not yet benchmarked".
 - The 💰 counter shows both session and lifetime totals.
@@ -186,7 +234,7 @@ Measured speed (session):  58.0 tok/s · TTFT 485ms (1 call)
 Measured speed (lifetime on this workstation): 46.9 tok/s · TTFT 2641ms (214 calls, last used 2026-04-20)
 ```
 
-In practice, Claude delegates more aggressively the longer a session runs. After about 5,000 offloaded tokens, it starts hunting for more work to push over. Reinforcing loop.
+In practice, the orchestrator delegates more aggressively the longer a session runs. After about 5,000 offloaded tokens, it starts hunting for more work to push over. Reinforcing loop.
 
 ## Model routing
 
@@ -207,17 +255,47 @@ Leave both unset and the router picks.
 
 ## Tools
 
+### `delegate` (recommended for Codex)
+
+Codex mode exposes one compact tool instead of the full legacy tool set. Codex decides what work is bounded, while the sidekick executes large-file first-pass review/summary, extraction, conversion, boilerplate, and drafts. Pass absolute `paths` whenever possible so file contents go directly to DeepSeek without first entering Codex context. DeepSeek thinking follows `HOUTINI_LM_DEEPSEEK_THINKING` and can be overridden per call; Codex still retains final decisions, edits, and verification.
+
+For DeepSeek thinking calls, `max_tokens` is treated as the desired visible
+answer budget. Houtini-LM adds a bounded hidden-reasoning allowance internally.
+If the model still returns reasoning only or hits the completion limit before a
+complete answer, the request is retried once with thinking disabled. Optional
+`max_chars` triggers a final thinking-disabled compression pass.
+
+`output_path` can write the final visible result beneath
+`HOUTINI_LM_ALLOWED_ROOTS`, returning only a short path/hash receipt to Codex.
+Its parent directory must already exist, and existing files require
+`overwrite: true`. This is bounded artifact output, not arbitrary file or
+command access; Houtini-LM still cannot execute shell commands.
+
+| Parameter | Required | Default | What it does |
+|-----------|----------|---------|-------------|
+| `task` | yes | - | Concrete bounded task and exact requested output. |
+| `paths` | no | - | Absolute file paths read by the MCP without entering Codex context. |
+| `model` | no | configured model | Optional per-call model override. |
+| `content` | no | - | Inline input when paths are not appropriate. |
+| `kind` | no | inferred | Output/budget hint: convert, extract, explain, summarize, review, draft, or general. |
+| `language` | no | - | Optional programming-language hint. |
+| `max_tokens` | no | *task budget* | Bounded by the task default and `HOUTINI_LM_AUTO_MAX_TOKENS`. |
+| `max_chars` | no | - | Visible character target; oversized answers receive a compression pass. |
+| `thinking` | no | environment | Per-call DeepSeek mode: `disabled`, `enabled`, or `auto`. |
+| `output_path` | no | - | Absolute output file beneath an allowed root; returns a compact receipt. |
+| `overwrite` | no | `false` | Permit replacing an existing `output_path`. |
+
 ### `chat`
 
-The workhorse. Send a task, get an answer. The description includes planning triggers that nudge Claude to identify offloadable work when it's starting a big task.
+The workhorse. Send a task, get an answer. The description includes planning triggers that nudge the orchestrator to identify offloadable work when it's starting a big task.
 
 | Parameter | Required | Default | What it does |
 |-----------|----------|---------|-------------|
 | `message` | yes | - | The task. Be specific about output format. |
 | `system` | no | - | Persona - "Senior TypeScript dev" not "helpful assistant" |
 | `temperature` | no | 0.3 | 0.1 for code, 0.3 for analysis, 0.7 for creative |
-| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). Pass a number to cap it. |
-| `json_schema` | no | - | Force structured JSON output conforming to a schema |
+| `max_tokens` | no | *task budget* | Bounded by the task default and `HOUTINI_LM_AUTO_MAX_TOKENS`. |
+| `json_schema` | no | - | Request valid JSON with the schema as guidance; provider-level conformance varies. |
 | `model` | no | *auto-route* | Pin a specific model id (e.g. `nvidia/nemotron-3-nano-30b-a3b:free` on OpenRouter). Overrides routing and `HOUTINI_LM_MODEL`. Useful on providers with many candidates. |
 
 ### `custom_prompt`
@@ -230,7 +308,7 @@ Three-part prompt: system, context, instruction. Keeping them separate prevents 
 | `system` | no | - | Persona + constraints, under 30 words |
 | `context` | no | - | Complete data to analyse. Never truncate. |
 | `temperature` | no | 0.3 | 0.1 for review, 0.3 for analysis |
-| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
+| `max_tokens` | no | *task budget* | Bounded by the task default and `HOUTINI_LM_AUTO_MAX_TOKENS`. |
 | `json_schema` | no | - | Force structured JSON output |
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 
@@ -243,7 +321,7 @@ Built for code analysis. Pre-configured system prompt with temperature and outpu
 | `code` | yes | - | Complete source code. Never truncate. |
 | `task` | yes | - | "Find bugs", "Explain this", "Write tests" |
 | `language` | no | - | "typescript", "python", "rust", etc. |
-| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
+| `max_tokens` | no | *task budget* | Bounded by the task default and `HOUTINI_LM_AUTO_MAX_TOKENS`. |
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 
 ### `code_task_files`
@@ -257,7 +335,7 @@ Includes a **pre-flight prefill estimator**: if measured per-model data from the
 | `paths` | yes | - | Array of absolute file paths. Relative paths are rejected. |
 | `task` | yes | - | "Find bugs across these files", "Audit this module" |
 | `language` | no | - | "typescript", "python", "rust", etc. |
-| `max_tokens` | no | *auto* | Defaults to 25% of the loaded model's context window (fallback 16,384). |
+| `max_tokens` | no | *task budget* | Bounded by the task default and `HOUTINI_LM_AUTO_MAX_TOKENS`. |
 | `model` | no | *auto-route* | Pin a specific model id. Overrides routing and `HOUTINI_LM_MODEL`. |
 
 ### `embed`
@@ -275,7 +353,7 @@ Health check and speed readout. Returns model name, context window, capability p
 
 ### `list_models`
 
-Lists everything on the LLM server - loaded and downloaded - with full metadata: architecture, quantisation, context window, capabilities, and HuggingFace enrichment data. Shows capability profiles describing what each model is best at, so Claude can make informed delegation decisions.
+Lists everything on the LLM server - loaded and downloaded - with full metadata: architecture, quantisation, context window, capabilities, and HuggingFace enrichment data. Shows capability profiles describing what each model is best at, so the orchestrator can make informed delegation decisions.
 
 ### `stats`
 
@@ -381,7 +459,7 @@ Summary
    Tokens offloaded: 10,915 (prompt: 7,289, completion: 3,626, reasoning: 0)
 ```
 
-Want a human-readable quality review rather than just latency numbers? Paste [SHAKEDOWN.md](./SHAKEDOWN.md) into a Claude session that has houtini-lm attached — Claude will drive the seven steps and write you a report on output quality as well as performance.
+Want a human-readable quality review rather than just latency numbers? Paste [SHAKEDOWN.md](./SHAKEDOWN.md) into an orchestrator session that has houtini-lm attached — the orchestrator will drive the seven steps and write you a report on output quality as well as performance.
 
 ## Think-block handling
 
@@ -399,19 +477,19 @@ The quality footer flags `think-blocks-stripped` when stripping occurred, `reaso
 
 ## Quality metadata
 
-Every response includes structured quality signals in the footer so Claude (or any orchestrator) can make informed trust decisions:
+Every response includes structured quality signals in the footer so the orchestrator can make informed trust decisions:
 
 ```
 ---
 Model: qwen3-coder-30b-a3b | 413→81 tokens | TTFT: 2355ms, 15.0 tok/s, 5.4s | Quality: think-blocks-stripped, tokens-estimated
-💰 Claude quota saved this session: 494 tokens across 1 offloaded call
+🤖 Sidekick tokens processed this session: 494 tokens across 1 offloaded call
 ```
 
 Flags include: `TRUNCATED` (partial result), `think-blocks-stripped`, `tokens-estimated` (usage data was missing, estimated from content length), `hit-max-tokens`. When no flags fire, the quality line is omitted — clean output, nothing to report.
 
 ## Session metrics resource
 
-The `houtini://metrics/session` MCP resource exposes cumulative offload stats as JSON. Claude can read this proactively to make smarter delegation decisions based on actual session performance:
+The `houtini://metrics/session` MCP resource exposes cumulative offload stats as JSON. The orchestrator can read this proactively to make smarter delegation decisions based on actual session performance:
 
 ```json
 {
@@ -435,17 +513,23 @@ The `houtini://metrics/session` MCP resource exposes cumulative offload stats as
 
 On **local** providers (LM Studio, Ollama, vLLM, llama.cpp) parallel MCP tool calls are automatically queued and run one at a time. A single-GPU host can only serve one request at a time anyway — without the semaphore, parallel calls stack timeouts and waste the generation budget.
 
-On **remote** providers (OpenRouter, DeepSeek, Groq, Cerebras, and anything detected as a non-local backend) the semaphore is skipped — the upstream handles parallelism natively and serialising artificially would throttle you. This is automatic; you don't need to configure it.
+On recognised **remote** providers (currently OpenRouter and DeepSeek) the semaphore is skipped — the upstream handles parallelism natively and serialising artificially would throttle it.
 
 ## Configuration
 
 | Variable | Default | What it does |
 |----------|---------|-------------|
 | `HOUTINI_LM_ENDPOINT_URL` | `http://localhost:1234` | Base URL of the OpenAI-compatible API. Legacy alias: `LM_STUDIO_URL`. |
-| `HOUTINI_LM_API_KEY` | *(none)* | Bearer token for authenticated endpoints. Legacy aliases: `LM_STUDIO_PASSWORD`, `LM_PASSWORD`, `OPENROUTER_API_KEY`. |
+| `HOUTINI_LM_API_KEY` | *(none)* | Bearer token for authenticated endpoints. `DEEPSEEK_API_KEY` and legacy aliases are also accepted. |
 | `HOUTINI_LM_MODEL` | *(auto-detect)* | Model identifier — leave blank to use whatever's loaded. Legacy alias: `LM_STUDIO_MODEL`. |
 | `HOUTINI_LM_PROVIDER` | *(auto-detect)* | Force provider-specific handling. Set to `openrouter` for OpenRouter attribution headers, `reasoning.exclude`, and no inference serialisation. Otherwise auto-detected from the endpoint URL. |
 | `HOUTINI_LM_CONTEXT_WINDOW` | `100000` | Fallback context window if the API doesn't report it. Legacy alias: `LM_CONTEXT_WINDOW`. |
+| `HOUTINI_LM_ORCHESTRATOR` | *(generic)* | Set `codex` to expose only the compact `delegate` tool and Codex-specific delegation guidance. |
+| `HOUTINI_LM_DEEPSEEK_THINKING` | `disabled` | Default DeepSeek request mode: `disabled`, `enabled`, or `auto`. `delegate` can override it per call. |
+| `HOUTINI_LM_AUTO_MAX_TOKENS` | `4096` | Hard ceiling for automatically selected and caller-requested output budgets. |
+| `HOUTINI_LM_MAX_INPUT_CHARS` | `400000` | Hard input-size ceiling for one Codex `delegate` call. |
+| `HOUTINI_LM_RESPONSE_METADATA` | `compact` for Codex, otherwise `full` | Footer mode: `none`, `compact`, or `full`. `delegate` returns no footer. |
+| `HOUTINI_LM_ALLOWED_ROOTS` | *(unrestricted)* | Comma-separated directories allowed for path-based delegation. Real paths are checked to block symlink, junction, traversal, and cross-drive escapes. |
 
 ## Compatible endpoints
 
@@ -467,7 +551,7 @@ Works with anything that speaks the OpenAI `/v1/chat/completions` API:
 
 All inference uses Server-Sent Events streaming. Tokens arrive incrementally. Since v2.9.0, houtini-lm sends MCP progress notifications on every streamed chunk — including during the thinking phase for reasoning models — which resets the SDK's 60-second client timeout. A 5-minute soft timeout acts as a safety net so a genuinely wedged connection can't hold a tool call open indefinitely; as long as tokens keep flowing, the per-chunk progress keeps the client side alive up to that ceiling.
 
-If the connection stalls (no new tokens for an extended period), you get a partial result instead of a timeout error. The footer shows `TRUNCATED` when this happens, and the quality metadata flags it so Claude knows to treat the output with appropriate caution.
+If the connection stalls (no new tokens for an extended period), you get a partial result instead of a timeout error. The footer shows `TRUNCATED` when this happens, and the quality metadata flags it so the orchestrator knows to treat the output with appropriate caution.
 
 ## Architecture
 

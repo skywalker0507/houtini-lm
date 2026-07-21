@@ -1,18 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "Houtini LM",
-  "description": "MCP server that connects Claude to any OpenAI-compatible LLM endpoint. Offload routine analysis to a local model and preserve your Claude context window.",
+  "description": "MCP server that connects any MCP client to an OpenAI-compatible LLM endpoint. Offload routine analysis to a sidekick model and preserve your primary model's context window.",
   "icon": "https://houtini.ai/favicon.ico",
   "repository": {
     "url": "https://github.com/houtini-ai/lm",
     "source": "github"
   },
-  "version": "2.13.2",
+  "version": "2.14.1",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@houtini/lm",
-      "version": "2.13.2",
+      "version": "2.14.1",
       "transport": [
         {
           "type": "stdio"
@@ -40,7 +40,43 @@
         },
         {
           "name": "HOUTINI_LM_PROVIDER",
-          "description": "Optional provider override: 'openrouter' forces OpenRouter-specific handling (attribution headers, reasoning.exclude, no inference serialisation). Auto-detected from the endpoint URL when possible.",
+          "description": "Optional provider override: 'openrouter' or 'deepseek'. Auto-detected from the endpoint URL when possible.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "HOUTINI_LM_ORCHESTRATOR",
+          "description": "Set to 'codex' to expose the compact delegate-only tool surface and Codex-specific guidance.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "HOUTINI_LM_DEEPSEEK_THINKING",
+          "description": "Default DeepSeek thinking mode: disabled, enabled, or auto. The Codex delegate tool may override it per call.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "HOUTINI_LM_AUTO_MAX_TOKENS",
+          "description": "Hard output-token ceiling. Defaults to 4096; Codex deployments commonly use 1800.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "HOUTINI_LM_MAX_INPUT_CHARS",
+          "description": "Hard character ceiling for one Codex delegate request. Use it to prevent accidental whole-repository or generated-PCB uploads.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "HOUTINI_LM_RESPONSE_METADATA",
+          "description": "Response footer mode: none, compact, or full. Delegate responses never include a footer.",
+          "isRequired": false,
+          "format": "string"
+        },
+        {
+          "name": "HOUTINI_LM_ALLOWED_ROOTS",
+          "description": "Comma-separated directories allowed for path-based delegation.",
           "isRequired": false,
           "format": "string"
         }

@@ -154,6 +154,27 @@ const PROMPT_HINTS: { pattern: RegExp; hints: PromptHints }[] = [
     },
   },
   {
+    // DeepSeek V4 Pro — reasoning-focused
+    pattern: /deepseek[- ]?v4[- ]?pro/i,
+    hints: {
+      codeTemp: 0.1,
+      chatTemp: 0.2,
+      outputConstraint: 'Respond with ONLY the requested output. No step-by-step reasoning. No preamble.'
+        + ' Use markdown: fenced code blocks for code, bullet points for lists.',
+      bestTaskTypes: ['code', 'analysis'],
+    },
+  },
+  {
+    // DeepSeek V4 Flash + legacy chat/reasoner/V3 aliases — general-purpose
+    pattern: /deepseek[- ]?v4[- ]?flash|deepseek.*(?:chat|reasoner)|deepseek[- ]?v3/i,
+    hints: {
+      codeTemp: 0.1,
+      chatTemp: 0.3,
+      outputConstraint: 'Be direct. Output only what was asked for. Use markdown formatting: fenced code blocks for code, bullet points for lists. No preamble.',
+      bestTaskTypes: ['code', 'chat', 'analysis'],
+    },
+  },
+  {
     pattern: /nomic.*embed|embed.*nomic/i,
     hints: {
       codeTemp: 0,

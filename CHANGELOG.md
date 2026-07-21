@@ -1,5 +1,45 @@
 # Changelog
 
+## [2.14.1] - 2026-07-05
+
+### Added
+- `delegate.max_chars` for a bounded visible-length target with an automatic
+  thinking-disabled compression pass.
+- `delegate.output_path` and `overwrite` for writing final visible artifacts
+  beneath `HOUTINI_LM_ALLOWED_ROOTS` while returning only a compact hash receipt.
+- Per-call `delegate.model` override for choosing V4 Pro or Flash by task.
+
+### Fixed
+- Codex `delegate.max_tokens` now represents the desired visible-answer budget.
+  Thinking calls receive a larger bounded generation envelope, preventing
+  hidden reasoning from consuming the entire answer allowance.
+- Reasoning-only, truncated and length-limited thinking calls automatically
+  retry once with thinking disabled.
+- `thinking:auto` is task-aware: review/explain/general may reason, while
+  extraction/conversion/summarization/drafts remain direct.
+
+## [2.14.0] - 2026-07-04
+
+### Added
+- **Codex-focused `delegate` tool** — when `HOUTINI_LM_ORCHESTRATOR=codex`, the server exposes one compact tool for bounded execution instead of eight overlapping tools. It accepts inline content or absolute file paths, supports environment/per-call DeepSeek thinking control, returns no metadata footer, and leaves decisions and verification to Codex.
+- **DeepSeek V4 provider profile** — supports V4 Pro/Flash thinking controls, JSON Output adaptation, remote retries, parallel inference, and current legacy alias routing.
+- **Task-aware output budgets and concise output constraints**, including Chinese task-kind detection.
+- **Per-call Codex delegate thinking control** plus an environment default, so projects can spend cheap sidekick reasoning without expanding Codex output.
+- **Delegate input-size guard** via `HOUTINI_LM_MAX_INPUT_CHARS` to reject accidental whole-repository or generated-artifact uploads.
+- **`DEEPSEEK_API_KEY` compatibility** in addition to the Houtini-specific key name.
+- **Mock MCP regression suite** covering the Codex tool surface, hard token cap, DeepSeek request shape, JSON output, and Windows cross-drive path rejection.
+
+### Fixed
+- `HOUTINI_LM_AUTO_MAX_TOKENS` is now a hard ceiling and can no longer be bypassed by task defaults or caller-provided limits.
+- `HOUTINI_LM_DEEPSEEK_THINKING=auto` recognises DeepSeek V4 model IDs.
+- JSON responses no longer receive a footer that makes them invalid JSON.
+- `HOUTINI_LM_ALLOWED_ROOTS` now rejects cross-drive paths, unresolved paths, symlink/junction escapes, and traversal.
+- Hidden reasoning content is no longer dumped to stderr.
+
+### Changed
+- Sidekick metrics are described as tokens processed rather than claiming exact primary-model savings.
+- Codex setup pins DeepSeek V4 Flash for bounded work, forwards API keys from the environment, and documents `enabled_tools`.
+
 ## [2.13.2] - 2026-04-21
 
 ### Fixed

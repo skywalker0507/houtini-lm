@@ -45,9 +45,11 @@ Strict-mode TypeScript is enabled — the build must pass with zero errors.
 `chatCompletionStreamingInner` in `src/index.ts` is where every inference call
 runs. The moving parts, in order:
 
-1. **`max_tokens` sizing** — if the caller didn't specify, derive 25% of the
-   active model's context window. Fallback `DEFAULT_MAX_TOKENS` (16384) when
-   context size is unknown.
+1. **`max_tokens` sizing** — generic tools combine the task-specific budget,
+   caller request, active model context, and `HOUTINI_LM_AUTO_MAX_TOKENS`.
+   Codex `delegate` treats the requested value as a visible-answer target; an
+   enabled thinking call adds `max(1024, visible × 2)` hidden-reasoning
+   allowance under the same global cap.
 2. **Reasoning-model gate** — branches on the current provider profile
    (`getProviderProfile().reasoningStyle`):
    - `'openrouter-field'` — send `reasoning: { exclude: true }`. OpenRouter
@@ -90,11 +92,18 @@ runs. The moving parts, in order:
    terminates it with a bare `</think>` before the real answer).
 8. **Empty-output safety nets**, tried in order:
    - `thinkStripFallback` — stripping emptied `content` but raw content had
-     text. Returns raw content with a `think-strip-empty` quality flag.
+     text. Returns a structured error with a `think-strip-empty` quality flag.
    - `reasoningFallback` — `content` was never populated but
      `reasoning_content` was streamed (the Nemotron/DeepSeek-R1 case).
-     Returns the raw reasoning with a `[No visible output — ...]` preamble
-     and a `reasoning-only` quality flag.
+     Returns a structured error without logging or exposing hidden reasoning,
+     plus a `reasoning-only` quality flag.
+
+The Codex delegate handler adds a second safety layer around this pipeline:
+reasoning-only, truncated or length-limited thinking calls retry once with
+thinking disabled and the original visible budget. Optional `max_chars`
+performs a final direct compression pass. Optional `output_path` writes only
+the final visible text beneath a configured allowed root; it never exposes a
+shell or tool loop to the sidekick.
 
 The `recordUsage` function then writes session counters, updates the
 in-memory lifetime mirror, and fires-and-forgets a SQLite write.
@@ -312,8 +321,14 @@ The `prepublishOnly` hook runs the build automatically. Use
 
 ## Testing
 
-Four independent test harnesses, each with a different scope:
+Six independent test harnesses, each with a different scope:
 
+- **`test-codex.mjs`** (`npm run test:codex`) — mock MCP regression suite
+  for the compact delegate surface, thinking fallback, token envelopes,
+  allowed roots and artifact writes.
+- **`test-live-codex.mjs`** (`npm run test:live-codex`) — small real
+  DeepSeek V4 Pro smoke test for thinking, bounded visible output and
+  `output_path`. Requires a DeepSeek API key.
 - **`test.mjs`** — **direct-client** integration test. Hits the provider's
   `/v1/*` endpoints without going through the MCP server. Good for
   regression-checking changes to streaming / parsing and for confirming a
@@ -364,8 +379,8 @@ Flags that can appear on a response footer (`Quality: ...` line):
 | `TRUNCATED` | Soft timeout or chunk timeout — partial result returned |
 | `PREFILL-STALL` | Timeout fired before ANY chunk arrived. Input probably too large for this model/hardware. |
 | `think-blocks-stripped` | Raw content had `<think>` blocks; stripped before returning |
-| `think-strip-empty` | Stripping emptied the content; returning raw reasoning as fallback |
-| `reasoning-only` | No `delta.content` at all; returning `delta.reasoning_content` as fallback. Usually means `reasoning_effort` is being ignored — check stderr. |
+| `think-strip-empty` | Stripping emptied the content; the model ignored the thinking-off control |
+| `reasoning-only` | No `delta.content` at all; a structured error is returned without exposing hidden reasoning. |
 | `tokens-estimated` | `usage` object missing from stream; token count estimated from content length |
 | `hit-max-tokens` | `finish_reason: 'length'` — generation hit the `max_tokens` cap |
 

@@ -1,6 +1,6 @@
 {
   "name": "@houtini/lm",
-  "version": "2.13.2",
+  "version": "2.14.1",
   "type": "module",
   "description": "MCP server for local LLMs — connects to LM Studio or any OpenAI-compatible endpoint",
   "mcpName": "io.github.houtini-ai/lm",
@@ -11,6 +11,10 @@
   "scripts": {
     "build": "tsc && node add-shebang.mjs",
     "dev": "tsc --watch",
+    "test": "npm run test:codex",
+    "test:codex": "npm run build && node test-codex.mjs",
+    "test:live-codex": "npm run build && node test-live-codex.mjs",
+    "test:integration": "node test-mcp-e2e.mjs",
     "shakedown": "node shakedown.mjs",
     "prepublishOnly": "npm run build"
   },

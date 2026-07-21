@@ -12,14 +12,14 @@ src/
   index.ts            MCP server — tool definitions, request handlers,
                       streaming, session + lifetime accounting, routing,
                       provider-profile registry
-  model-cache.ts      SQLite (sql.js / WASM) — model profiles, thinking-
+  model-cache.ts      SQLite (node:sqlite, WAL) — model profiles, thinking-
                       support detection, per-model performance history
 server.json           MCP registry manifest
 test.mjs              Direct-client integration tests (hits /v1 endpoints)
 test-mcp-e2e.mjs      End-to-end MCP harness — spawns the built server over
                       stdio, drives real tool calls, verifies provider paths
 benchmark.mjs         Throughput + savings benchmark
-shakedown.mjs         End-to-end self-test — runs all 7 tools in sequence
+shakedown.mjs         End-to-end self-test — runs 7 of the 8 tools in sequence (all except stats)
 SHAKEDOWN.md          Canonical test prompt (for running via Claude chat)
 add-shebang.mjs       Post-build — prepends #!/usr/bin/env node to dist/index.js
 ```
@@ -171,8 +171,10 @@ of if-statements."
 
 ## SQLite cache — two tables
 
-Database path: `~/.houtini-lm/model-cache.db`. Uses `sql.js` (pure WASM) to
-avoid native dependencies.
+Database path: `~/.houtini-lm/model-cache.db`. Uses `node:sqlite` (Node's
+built-in SQLite, Node ≥ 22.5) in WAL mode with `busy_timeout` — no third-party
+native dependency, and multiple houtini-lm processes can share one cache file
+with real cross-process concurrency (per-row writes, not whole-file snapshots).
 
 ### `model_profiles`
 
@@ -312,9 +314,10 @@ The `prepublishOnly` hook runs the build automatically. Use
 - **Model loading is slow** (minutes on cold start). Never try to JIT-load
   a model — MCP has a ~60s timeout. The routing layer suggests better
   models instead.
-- **sql.js is WASM, by design.** Zero native deps, works everywhere. Don't
-  swap for `better-sqlite3` — node-gyp is a footgun for npm-installable
-  MCP servers.
+- **`node:sqlite`, by design.** Node's built-in SQLite gives real
+  cross-process concurrency (WAL) with no third-party native dependency. Don't
+  swap for `better-sqlite3` — node-gyp is a footgun for npm-installable MCP
+  servers. The tradeoff is a Node ≥ 22.5 floor (declared in `engines`).
 - **`completion_tokens_details.reasoning_tokens`** arrives only on the
   final usage chunk — you must set `stream_options.include_usage: true` to
   get it. We do.
@@ -344,7 +347,7 @@ Six independent test harnesses, each with a different scope:
   override.
 - **`benchmark.mjs`** — throughput and savings benchmark, ad-hoc.
 - **`shakedown.mjs`** (`npm run shakedown`) — the canonical self-test.
-  Runs all 7 tools end-to-end and prints a summary table with TTFT, tok/s,
+  Runs 7 of the 8 tools end-to-end (all except `stats`) and prints a summary table with TTFT, tok/s,
   token counts, and reasoning-token split per call. Use this to verify an
   install or post-release.
 

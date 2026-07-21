@@ -54,15 +54,15 @@ jobs:
           echo "" >> $GITHUB_OUTPUT
           echo '```bash' >> $GITHUB_OUTPUT
           echo "git clone https://github.com/${{ github.repository }}.git" >> $GITHUB_OUTPUT
-          echo "cd local-llm-mcp" >> $GITHUB_OUTPUT
+          echo "cd houtini-lm" >> $GITHUB_OUTPUT
           echo "npm install" >> $GITHUB_OUTPUT
           echo "npm run build" >> $GITHUB_OUTPUT
           echo '```' >> $GITHUB_OUTPUT
           echo "" >> $GITHUB_OUTPUT
           echo "## 📚 Documentation" >> $GITHUB_OUTPUT
           echo "" >> $GITHUB_OUTPUT
-          echo "- [Complete Guide](https://github.com/${{ github.repository }}/blob/main/COMPLETE_GUIDE.md)" >> $GITHUB_OUTPUT
-          echo "- [Getting Started](https://github.com/${{ github.repository }}/blob/main/GETTING_STARTED.md)" >> $GITHUB_OUTPUT
+          echo "- [README](https://github.com/${{ github.repository }}/blob/main/README.md)" >> $GITHUB_OUTPUT
+          echo "- [Getting Started](https://github.com/${{ github.repository }}/blob/main/docs/GETTING-STARTED.md)" >> $GITHUB_OUTPUT
         fi
         echo "EOF" >> $GITHUB_OUTPUT
     

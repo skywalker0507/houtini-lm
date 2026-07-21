@@ -18,8 +18,10 @@
  */
 
 import { readFileSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'node:url';
 
+const REPO = dirname(fileURLToPath(import.meta.url));
 const BASE = process.env.LM_STUDIO_URL || 'http://localhost:1234';
 const DELEGATION_OVERHEAD = 250; // MCP tool call envelope (tokens)
 
@@ -55,17 +57,16 @@ function tok(text) {
   return Math.ceil((text || '').length / 4);
 }
 
-function loadFile(path) {
-  return readFileSync(path, 'utf-8');
+// Fixtures resolve relative to this repo, so the benchmark runs on a clean checkout.
+function loadFile(relPath) {
+  return readFileSync(join(REPO, relPath), 'utf-8');
 }
 
 // ── Real source files ────────────────────────────────────────────────
 
 const FILES = {
-  indexTs: loadFile(join('C:/MCP/houtini-lm/src/index.ts')),
-  modelCache: loadFile(join('C:/MCP/houtini-lm/src/model-cache.ts')),
-  geminiService: loadFile(join('C:/MCP/gemini-mcp/src/services/gemini/index.ts')),
-  imagePrompt: loadFile(join('C:/MCP/gemini-mcp/src/tools/image-prompt-assistant.ts')),
+  indexTs: loadFile('src/index.ts'),
+  modelCache: loadFile('src/model-cache.ts'),
 };
 
 console.log('\nSource files loaded:');
@@ -110,20 +111,7 @@ const tasks = [
     maxTokens: 1024,
   },
 
-  // ── Pattern 3: Review an unfamiliar codebase ──────────────────────
-  {
-    name: 'Review external repo: gemini service (581 lines)',
-    file: 'geminiService',
-    claudeContextTokens: tok(FILES.geminiService),
-    claudeOutputEstimate: 400,
-    messages: [
-      { role: 'system', content: 'Senior TypeScript reviewer. You are reviewing code you have never seen before. Identify: error handling gaps, potential crashes, resource leaks, API misuse. Max 8 bullet points, reference function names.' },
-      { role: 'user', content: `Review this Gemini API service for issues:\n\n\`\`\`typescript\n${FILES.geminiService}\n\`\`\`` },
-    ],
-    maxTokens: 1024,
-  },
-
-  // ── Pattern 4: Generate test stubs for a real file ────────────────
+  // ── Pattern 3: Generate test stubs for a real file ────────────────
   {
     name: 'Generate test stubs: model-cache.ts (670 lines)',
     file: 'modelCache',
@@ -136,20 +124,7 @@ const tasks = [
     maxTokens: 2048,
   },
 
-  // ── Pattern 5: Explain unfamiliar code ────────────────────────────
-  {
-    name: 'Explain code: image-prompt-assistant (833 lines)',
-    file: 'imagePrompt',
-    claudeContextTokens: tok(FILES.imagePrompt),
-    claudeOutputEstimate: 500,
-    messages: [
-      { role: 'system', content: 'Technical writer explaining code to a developer joining the project. Cover: purpose, main functions, data flow, key design decisions. Use headings and bullet points. Max 500 words.' },
-      { role: 'user', content: `Explain this module:\n\n\`\`\`typescript\n${FILES.imagePrompt}\n\`\`\`` },
-    ],
-    maxTokens: 1024,
-  },
-
-  // ── Pattern 6: Extract types / API surface ────────────────────────
+  // ── Pattern 4: Extract types / API surface ────────────────────────
   {
     name: 'Extract API surface: index.ts → type definitions',
     file: 'indexTs',

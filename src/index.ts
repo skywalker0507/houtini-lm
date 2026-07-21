@@ -6,6 +6,11 @@
  * chat, custom prompts, code tasks, and model discovery as MCP tools.
  */
 
+// Must be first: registers the node:sqlite experimental-warning filter BEFORE
+// the model-cache import (which pulls in node:sqlite and would emit the warning
+// at import time, i.e. before any later-registered handler could catch it).
+import './suppress-experimental-warnings.js';
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -169,6 +174,7 @@ const SOFT_TIMEOUT_MS = 300_000;             // 5 min — progress notifications
 const READ_CHUNK_TIMEOUT_MS = 30_000;        // max wait for a single SSE chunk mid-stream
 const PREFILL_TIMEOUT_MS = 180_000;          // max wait for the FIRST chunk — prompt prefill on slow hardware with big inputs can legitimately take 1-2 min
 const PREFILL_KEEPALIVE_MS = 10_000;         // fire a progress notification every N ms while waiting for prefill to finish
+const STREAM_PROGRESS_THROTTLE_MS = 500;     // min gap between per-delta streaming progress pings — decoupled from token rate so a fast model can't flood stdio
 const FALLBACK_CONTEXT_LENGTH = parseInt(
   process.env.HOUTINI_LM_CONTEXT_WINDOW || process.env.LM_CONTEXT_WINDOW || '100000',
   10,
@@ -304,6 +310,61 @@ async function hydrateLifetimeFromDb(): Promise<void> {
   }
 }
 
+/**
+ * Compose the system prompt sent to the local model. Guarantees a non-empty,
+ * directionally-productive instruction on EVERY call — the previous per-handler
+ * merge sent no system message at all when the caller passed none and the model
+ * family had no outputConstraint (Llama/Nemotron/Granite/gpt-oss/unknown).
+ * Layers, in order:
+ *   base       — persona (+ task, for code tasks); always present
+ *   grounding  — universal anti-hallucination line (the trust lever for the QA loop)
+ *   format     — JSON-only when a json_schema is set (which SUPPRESSES the
+ *                markdown guidance that would otherwise contradict it);
+ *                otherwise the task-appropriate format line plus any per-family
+ *                constraint.
+ * Compact by design — every token here is prefill the estimator and latency pay for.
+ */
+function buildSystemPrompt(opts: {
+  base: string;
+  formatLine?: string;
+  modelConstraint?: string;
+  structuredOutput?: boolean;
+}): string {
+  const layers: string[] = [opts.base.trim()];
+  layers.push(
+    'Base your answer only on the information provided in this conversation. ' +
+    'If it is insufficient to answer correctly, say what is missing rather than guessing.',
+  );
+  if (opts.structuredOutput) {
+    layers.push('Return only valid JSON conforming to the requested schema — no prose, no markdown, no code fences.');
+  } else {
+    if (opts.formatLine && opts.formatLine.trim()) layers.push(opts.formatLine.trim());
+    if (opts.modelConstraint && opts.modelConstraint.trim()) layers.push(opts.modelConstraint.trim());
+  }
+  return layers.join('\n\n');
+}
+
+/**
+ * Generation throughput in tokens/sec, isolating decode time from prefill.
+ * `generationMs` spans connect + prefill + decode; dividing by the whole span
+ * makes a large-prompt call look many times slower than the model actually
+ * decodes, and that pessimistic number is what the footer, the first-call
+ * benchmark, and the persisted per-model stats report back to the orchestrator.
+ * Subtract TTFT so the denominator is the decode window. Returns null when it
+ * can't be measured.
+ *
+ * Known limitation (tracked separately): for thinking models TTFT is time to
+ * first *visible* token, so reasoning time is excluded from the denominator
+ * while reasoning tokens remain in completion_tokens — resolving that needs the
+ * TTFT-vs-reasoning fix, out of scope for this change.
+ */
+function computeTokPerSec(resp: StreamingResult): number | null {
+  if (!resp.usage) return null;
+  const decodeMs = resp.generationMs - (resp.ttftMs ?? 0);
+  if (decodeMs <= 50) return null;
+  return resp.usage.completion_tokens / (decodeMs / 1000);
+}
+
 function recordUsage(resp: StreamingResult) {
   session.calls++;
   const promptTokens = resp.usage?.prompt_tokens ?? 0;
@@ -320,9 +381,7 @@ function recordUsage(resp: StreamingResult) {
   }
 
   // Tok/s used by both session and lifetime stats
-  const tokPerSec = resp.usage && resp.generationMs > 50
-    ? (resp.usage.completion_tokens / (resp.generationMs / 1000))
-    : 0;
+  const tokPerSec = computeTokPerSec(resp) ?? 0;
 
   // Session per-model (unchanged behaviour)
   if (resp.model) {
@@ -430,15 +489,28 @@ function apiHeaders(): Record<string, string> {
 
 // ── Request semaphore ────────────────────────────────────────────────
 // Most local LLM servers run a single model and queue parallel requests,
-// which stacks timeouts and wastes the 55s budget. This semaphore ensures
-// only one inference call runs at a time; others wait in line.
+// which stacks timeouts and wastes the budget. This semaphore ensures only one
+// inference call runs at a time; others wait in line.
+
+// Global override: HOUTINI_LM_SERIALISE=0 (or false/no/off) turns OFF inference
+// serialisation entirely — both the in-process semaphore and the cross-process
+// file lock. The right setting for backends that batch requests natively (vLLM,
+// TGI, SGLang), where one-at-a-time only throttles throughput. Default on, which
+// suits a single-model LM Studio / Ollama host contending for one GPU.
+const SERIALISE_INFERENCE = !/^(0|false|no|off)$/i.test(process.env.HOUTINI_LM_SERIALISE || '');
+
+/** Serialise inference for the current backend? Combines the env override with
+ *  the provider profile (OpenRouter and other parallel-friendly backends off). */
+function shouldSerialiseInference(): boolean {
+  return SERIALISE_INFERENCE && getProviderProfile().serialiseInference;
+}
 
 let inferenceLock: Promise<void> = Promise.resolve();
 
 function withInferenceLock<T>(fn: () => Promise<T>): Promise<T> {
-  // Remote providers (OpenRouter etc.) benefit from parallelism and do
-  // their own rate-limit handling; serialising here just throttles us.
-  if (!getProviderProfile().serialiseInference) return fn();
+  // Skip when serialisation is off (env override) or the backend is
+  // parallel-friendly (OpenRouter etc.) — serialising there just throttles us.
+  if (!shouldSerialiseInference()) return fn();
   let release: () => void;
   const next = new Promise<void>((resolve) => { release = resolve; });
   const wait = inferenceLock;
@@ -466,6 +538,8 @@ interface StreamingResult {
     total_tokens: number;
     /** OpenAI: how many of the completion tokens were reasoning (hidden) */
     completion_tokens_details?: { reasoning_tokens?: number };
+    /** OpenAI: how many prompt tokens were served from the prefix cache (KV reuse) */
+    prompt_tokens_details?: { cached_tokens?: number };
   };
   finishReason: string;
   truncated: boolean;
@@ -479,6 +553,8 @@ interface StreamingResult {
   reasoningFallback?: boolean;
   /** Truncation caused by prefill stall (no chunks received) vs mid-stream stall */
   prefillStall?: boolean;
+  /** Error payload received mid-stream from the backend (OpenRouter/vLLM/llama.cpp emit these) */
+  streamError?: string;
 }
 
 /** OpenAI-compatible response_format for structured output */
@@ -820,19 +896,26 @@ async function fetchWithRetry(
       if ((res.status === 429 || res.status >= 500) && attempt < retries) {
         const retryAfter = parseRetryAfter(res.headers.get('retry-after'));
         try { await res.body?.cancel(); } catch { /* ignore */ }
-        const base = 400 * (attempt + 1);
-        const target = Math.min(Math.max(base, retryAfter ?? 0), 10_000);
-        const delay = Math.round(target * (0.5 + Math.random())); // 0.5×..1.5×
+        // Exponential base capped at 10s, but honour an explicit server
+        // Retry-After (up to 60s) even when larger. Jitter UPWARD only
+        // (target..1.5×) so we never retry before the server-mandated delay.
+        const base = Math.min(400 * (attempt + 1), 10_000);
+        const target = Math.max(base, Math.min(retryAfter ?? 0, 60_000));
+        const delay = Math.round(target * (1 + Math.random() * 0.5));
         await new Promise((r) => setTimeout(r, delay));
         continue;
       }
       return res;
     } catch (e) {
       lastErr = e;
-      if (attempt < retries) {
-        const delay = Math.round(400 * (attempt + 1) * (0.5 + Math.random()));
-        await new Promise((r) => setTimeout(r, delay));
-      }
+      // A timeout abort can mean the server already received the POST and began
+      // a (billed) generation — re-POSTing /v1/chat/completions would duplicate
+      // it. Only retry errors that indicate the request never reached the
+      // server (connection refused/reset); never on our own abort.
+      const isAbort = e instanceof Error && e.name === 'AbortError';
+      if (isAbort || attempt >= retries) break;
+      const delay = Math.round(400 * (attempt + 1) * (1 + Math.random() * 0.5));
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
@@ -865,11 +948,122 @@ async function timedRead(
  * return whatever content we have so far with `truncated: true`.
  * This means large code reviews return partial results instead of nothing.
  */
+/** Optional per-request sampling controls, passed through to the backend when set. */
+interface SamplingParams {
+  seed?: number;
+  stop?: string | string[];
+  topP?: number;
+  topK?: number;
+  repeatPenalty?: number;
+  frequencyPenalty?: number;
+  presencePenalty?: number;
+}
+
+interface InferenceOptions {
+  temperature?: number;
+  maxTokens?: number;
+  model?: string;
+  responseFormat?: ResponseFormat;
+  progressToken?: string | number;
+  sampling?: SamplingParams;
+}
+
+/**
+ * Extract and RANGE-VALIDATE optional sampling params from tool args. Out-of-range,
+ * NaN, or wrong-type values are dropped (undefined) rather than forwarded — the
+ * backend then applies its own default. This also closes the earlier gap where an
+ * unvalidated max_tokens/temperature could reach the upstream request.
+ */
+function extractSamplingParams(args: Record<string, unknown>): SamplingParams {
+  const range = (v: unknown, min: number, max: number): number | undefined => {
+    const n = typeof v === 'number' ? v : NaN;
+    return Number.isFinite(n) && n >= min && n <= max ? n : undefined;
+  };
+  const stopRaw = args.stop;
+  const stop = typeof stopRaw === 'string'
+    ? stopRaw
+    : Array.isArray(stopRaw)
+      ? (stopRaw.filter((s) => typeof s === 'string').slice(0, 4) as string[])
+      : undefined;
+  return {
+    seed: Number.isInteger(args.seed) ? (args.seed as number) : undefined,
+    stop: stop && stop.length ? stop : undefined,
+    topP: range(args.top_p, 0, 1),
+    topK: range(args.top_k, 1, 100_000),
+    repeatPenalty: range(args.repeat_penalty, 0, 2),
+    frequencyPenalty: range(args.frequency_penalty, -2, 2),
+    presencePenalty: range(args.presence_penalty, -2, 2),
+  };
+}
+
+/** Clamp a caller-supplied temperature to a sane range, or undefined if unusable. */
+function validTemperature(v: unknown): number | undefined {
+  const n = typeof v === 'number' ? v : NaN;
+  return Number.isFinite(n) && n >= 0 && n <= 2 ? n : undefined;
+}
+
+/**
+ * Minimum caller-supplied max_tokens the server will honour. Values below this
+ * are discarded so the dynamic context-based budget (25% of the model's context
+ * window) applies instead — MCP clients habitually pass tiny caps like 256 that
+ * strangle reasoning models. Set HOUTINI_LM_MIN_TOKENS=0 to honour any value
+ * (e.g. deliberate micro-chunking on slow hardware), or a different floor.
+ */
+const MIN_MAX_TOKENS = (() => {
+  const v = Number(process.env.HOUTINI_LM_MIN_TOKENS);
+  return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 4096;
+})();
+
+/** Clamp a caller-supplied max_tokens to a positive sane range, or undefined. */
+function validMaxTokens(v: unknown): number | undefined {
+  const n = typeof v === 'number' ? v : NaN;
+  if (!Number.isInteger(n) || n <= 0 || n > 1_000_000) return undefined;
+  if (n < MIN_MAX_TOKENS) {
+    process.stderr.write(
+      `[houtini-lm] max_tokens=${n} is below the ${MIN_MAX_TOKENS} floor — ignoring it and using the dynamic context-based budget (HOUTINI_LM_MIN_TOKENS=0 to allow)\n`,
+    );
+    return undefined;
+  }
+  return n;
+}
+
+/**
+ * Build an OpenAI response_format from the tool's json_schema input. Accepts
+ * BOTH the documented wrapper `{ name, schema, strict }` and a bare JSON Schema
+ * (which the description invites) — the latter previously produced undefined
+ * name/schema and silently unconstrained output.
+ */
+function toResponseFormat(js: unknown): ResponseFormat | undefined {
+  if (!js || typeof js !== 'object') return undefined;
+  const obj = js as Record<string, unknown>;
+  const hasWrapper = !!obj.schema && typeof obj.schema === 'object';
+  const schema = (hasWrapper ? obj.schema : obj) as Record<string, unknown>;
+  const name = hasWrapper && typeof obj.name === 'string' ? obj.name : 'response';
+  const strict = hasWrapper && typeof obj.strict === 'boolean' ? obj.strict : true;
+  return { type: 'json_schema', json_schema: { name, strict, schema } };
+}
+
 async function chatCompletionStreaming(
   messages: ChatMessage[],
   options: CompletionOptions = {},
 ): Promise<StreamingResult> {
   return withInferenceLock(() => chatCompletionStreamingInner(messages, options));
+}
+
+/**
+ * Pull a human-readable message out of an OpenAI-style mid-stream error
+ * payload (`data: {"error":{...}}`). Returns undefined when the chunk carries
+ * no error, so callers can treat a truthy result as "the backend failed".
+ */
+function extractStreamError(json: unknown): string | undefined {
+  if (!json || typeof json !== 'object') return undefined;
+  const err = (json as { error?: unknown }).error;
+  if (!err) return undefined;
+  if (typeof err === 'string') return err;
+  if (typeof err === 'object' && typeof (err as { message?: unknown }).message === 'string') {
+    return (err as { message: string }).message;
+  }
+  return JSON.stringify(err);
 }
 
 /** Get the first loaded model's info for context-aware defaults. */
@@ -914,6 +1108,27 @@ async function chatCompletionStreamingInner(
       effectiveMaxTokens = Math.min(pctBased, HOUTINI_LM_AUTO_MAX_TOKENS);
     }
   }
+  let effectiveMaxTokens = options.maxTokens ?? DEFAULT_MAX_TOKENS;
+  if (!options.maxTokens && contextLen) {
+    effectiveMaxTokens = Math.floor(contextLen * 0.25);
+  }
+
+  // Never request more output than the context window can hold alongside the
+  // prompt — vLLM (and strict OpenAI backends) reject prompt+max_tokens >
+  // context with a 400 instead of clamping. Conservative prompt estimate:
+  // 1 token ≈ 3 chars, plus per-message overhead.
+  const promptChars = messages.reduce(
+    (n, m) => n + (typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length),
+    0,
+  );
+  const capToContext = (requested: number): number => {
+    if (!contextLen) return requested;
+    const cap = contextLen - (Math.ceil(promptChars / 3) + 64 * messages.length + 512);
+    // If the prompt alone (over)fills the context, don't mangle the request —
+    // let the backend report the real overflow.
+    return cap > 0 ? Math.min(requested, cap) : requested;
+  };
+  effectiveMaxTokens = capToContext(effectiveMaxTokens);
 
   // Provider profile — used for both response_format adaptation and thinking
   // control. Computed once up front so both paths share the same detection.
@@ -957,6 +1172,20 @@ async function chatCompletionStreamingInner(
   }
   if (adaptedResponseFormat) {
     body.response_format = adaptedResponseFormat;
+  }
+
+  // Optional sampling controls — forwarded only when the caller set them (already
+  // range-validated in extractSamplingParams). Backends ignore unknown fields, so
+  // sending e.g. top_k to one that doesn't support it is harmless.
+  const s = options.sampling;
+  if (s) {
+    if (s.seed !== undefined) body.seed = s.seed;
+    if (s.stop !== undefined) body.stop = s.stop;
+    if (s.topP !== undefined) body.top_p = s.topP;
+    if (s.topK !== undefined) body.top_k = s.topK;
+    if (s.repeatPenalty !== undefined) body.repeat_penalty = s.repeatPenalty;
+    if (s.frequencyPenalty !== undefined) body.frequency_penalty = s.frequencyPenalty;
+    if (s.presencePenalty !== undefined) body.presence_penalty = s.presencePenalty;
   }
 
   // Handle thinking/reasoning models.
@@ -1075,10 +1304,47 @@ async function chatCompletionStreamingInner(
     }).catch(() => { /* best-effort — don't break streaming */ });
   };
 
+  // Throttled variant for the per-delta streaming updates. Streaming fires a
+  // progress event on every content/reasoning chunk; on a fast model (e.g.
+  // 145 tok/s) that would be ~145 JSON-RPC notifications/sec over stdio,
+  // flooding the transport and the client's notification handler. Gate those
+  // on a time interval so the notification rate is decoupled from the token
+  // rate — slow models still update often, fast models emit at most one ping
+  // per interval. The immediate connect ping and the interval keepalives below
+  // bypass this deliberately.
+  let lastStreamProgressMs = 0;
+  const sendStreamProgress = (message: string) => {
+    const now = Date.now();
+    if (now - lastStreamProgressMs < STREAM_PROGRESS_THROTTLE_MS) return;
+    lastStreamProgressMs = now;
+    sendProgress(message);
+  };
+
   // Ping once immediately — resets the client's timeout clock as soon as the
   // tool call is acknowledged server-side, regardless of how long prefill or
   // the upstream handshake takes.
   sendProgress('Connecting to model...');
+
+  // Cross-process inference serialisation (local single-model backends only).
+  // Acquire BEFORE the request so only one process at a time drives the model;
+  // the in-process semaphore already gates same-process calls, so this only ever
+  // contends across processes. Keepalive via sendProgress during the wait so a
+  // queued call doesn't sit silent past the client's request timeout. Fail-open:
+  // the lock module returns a no-op release on error or after the wait cap.
+  const canKeepalive = options.progressToken !== undefined;
+  const releaseInferenceLock = shouldSerialiseInference()
+    ? await acquireInferenceLock({
+        onWait: canKeepalive
+          ? (waitedMs) => sendProgress(`Waiting for the local model — another request is running (${(waitedMs / 1000).toFixed(0)}s)`)
+          : undefined,
+        // Without a progressToken we can't keep the client alive during a long
+        // wait, so fail open well before the typical ~60s client request timeout
+        // rather than sit silent in the queue and get aborted.
+        maxWaitMs: canKeepalive ? undefined : 45_000,
+      })
+    : () => { /* parallel-friendly backend (e.g. OpenRouter) */ };
+
+  try {
 
   // Pre-fetch heartbeat — keep the client alive while we wait for the
   // upstream LLM to return response headers. Cleared once fetch resolves.
@@ -1126,6 +1392,12 @@ async function chatCompletionStreamingInner(
   let buffer = '';
   let ttftMs: number | undefined;
   let firstChunkReceived = false;
+  // Backends (OpenRouter, vLLM, llama.cpp) can emit an error object mid-stream
+  // — `data: {"error":{...}}` — then close the connection normally. Without
+  // capturing it, the loop parses the payload, matches no field, and returns
+  // the partial/empty content as a clean success. Track it so we can surface
+  // the real cause instead of silently corrupting the result.
+  let streamError: string | undefined;
 
   // Prefill keep-alive — even after HTTP headers flush, the first SSE chunk
   // can still lag while the model finishes prompt processing. Fire a progress
@@ -1180,6 +1452,17 @@ async function chatCompletionStreamingInner(
 
         try {
           const json = JSON.parse(trimmed.slice(6));
+
+          // Mid-stream error from the backend — capture the cause and stop.
+          // The connection usually closes normally right after, so without
+          // this the partial result would be returned as a success.
+          const errMsg = extractStreamError(json);
+          if (errMsg) {
+            streamError = errMsg;
+            truncated = true;
+            break;
+          }
+
           if (json.model) model = json.model;
 
           const delta = json.choices?.[0]?.delta;
@@ -1198,14 +1481,20 @@ async function chatCompletionStreamingInner(
               ? delta.reasoning
               : '';
           if (reasoningChunk) {
+            // TTFT = time to first token of ANY channel (true prefill end). For
+            // thinking models the first token is reasoning, not content; setting
+            // TTFT here keeps the prefill estimator from mistaking the whole
+            // reasoning phase for prefill (which caused spurious code_task_files
+            // refusals) and keeps the decode-window tok/s denominator consistent.
+            if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             reasoning += reasoningChunk;
-            sendProgress(`Thinking... (${reasoning.length} chars of reasoning)`);
+            sendStreamProgress(`Thinking... (${reasoning.length} chars of reasoning)`);
           }
 
           if (typeof delta?.content === 'string' && delta.content.length > 0) {
             if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             content += delta.content;
-            sendProgress(`Streaming... ${content.length} chars`);
+            sendStreamProgress(`Streaming... ${content.length} chars`);
           }
 
           const reason = json.choices?.[0]?.finish_reason;
@@ -1217,6 +1506,11 @@ async function chatCompletionStreamingInner(
           // Skip unparseable chunks (partial JSON, comments, etc.)
         }
       }
+
+      // A mid-stream error breaks the inner line loop; also stop reading here
+      // rather than waiting out the per-chunk timeout on a connection the
+      // backend is about to close.
+      if (streamError) break;
     }
 
     // Flush remaining buffer — the usage chunk often arrives in the final SSE
@@ -1226,6 +1520,11 @@ async function chatCompletionStreamingInner(
       if (trimmed.startsWith('data: ') && trimmed !== 'data: [DONE]') {
         try {
           const json = JSON.parse(trimmed.slice(6));
+          const errMsg = extractStreamError(json);
+          if (errMsg) {
+            streamError = errMsg;
+            truncated = true;
+          }
           if (json.model) model = json.model;
           const delta = json.choices?.[0]?.delta;
           const finalReasoningChunk = (typeof delta?.reasoning_content === 'string' && delta.reasoning_content.length > 0)
@@ -1234,6 +1533,7 @@ async function chatCompletionStreamingInner(
               ? delta.reasoning
               : '';
           if (finalReasoningChunk) {
+            if (ttftMs === undefined) ttftMs = Date.now() - startTime;
             reasoning += finalReasoningChunk;
           }
           if (typeof delta?.content === 'string' && delta.content.length > 0) {
@@ -1266,6 +1566,14 @@ async function chatCompletionStreamingInner(
 
   const generationMs = Date.now() - startTime;
 
+  // Backend failed mid-stream and produced nothing usable — surface the real
+  // cause as an error rather than returning an empty "success" the orchestrator
+  // would treat as a valid (empty) answer. When partial content did arrive we
+  // keep it but carry streamError through so the footer flags it.
+  if (streamError && !content.trim() && !reasoning.trim()) {
+    throw new Error(`Upstream model error mid-stream: ${streamError}`);
+  }
+
   // Strip <think>...</think> reasoning blocks from models that always emit them
   // inline on the content channel (e.g. GLM Flash, Ollama Qwen3). Claude doesn't
   // need the model's internal reasoning. Handle three shapes:
@@ -1276,7 +1584,18 @@ async function chatCompletionStreamingInner(
   //      real answer. Strip everything up to and including the first closer.
   let cleanContent = content.replace(/<think>[\s\S]*?<\/think>\s*/g, '');   // closed blocks
   cleanContent = cleanContent.replace(/^<think>\s*/, '');                    // orphaned opening tag
-  cleanContent = cleanContent.replace(/^[\s\S]*?<\/think>\s*/, '');          // orphaned closing tag
+  // Orphaned closing tag: reasoning streamed on the content channel then a bare
+  // </think> before the answer (Ollama Qwen3). Strip up to the first closer ONLY
+  // for models KNOWN to emit think blocks (per the cached profile). For any other
+  // model, leave it: a real answer that merely quotes "</think>" would otherwise
+  // be truncated — and a leaked reasoning prefix (visible, recoverable) is a far
+  // safer failure than deleting answer text (silent, unrecoverable). The earlier
+  // backtick heuristic was lose-lose (leaked reasoning containing code, still
+  // deleted answers with an unquoted literal); the profile flag is the right signal.
+  const thinkProfile = await getThinkingSupport(modelId).catch(() => null);
+  if (thinkProfile?.emitsThinkBlocks && cleanContent.includes('</think>')) {
+    cleanContent = cleanContent.replace(/^[\s\S]*?<\/think>\s*/, '');
+  }
   cleanContent = cleanContent.trim();
 
   // Safety nets for empty visible output. Try in order:
@@ -1317,7 +1636,12 @@ async function chatCompletionStreamingInner(
     thinkStripFallback,
     reasoningFallback,
     prefillStall,
+    streamError,
   };
+
+  } finally {
+    releaseInferenceLock();
+  }
 }
 
 // Backend detection. Probed once on first listModelsRaw() call, cached for
@@ -1590,7 +1914,11 @@ interface PrefillEstimate {
 async function estimatePrefill(inputChars: number, modelId: string): Promise<PrefillEstimate> {
   const inputTokens = Math.ceil(inputChars / CHARS_PER_TOKEN);
 
-  // 1. Linear fit over recent samples (preferred).
+  // 1. Linear fit over recent samples (preferred); 2. ratio fallback from the
+  // SAME samples when there aren't enough for a fit. Both use the per-call
+  // (promptTokens, ttft) pairs, so the ratio can't mix populations the way the
+  // old aggregate did (avg prompt tokens over all calls vs avg TTFT over only
+  // TTFT-bearing calls), which skewed the rate and mis-fired the refusal guard.
   try {
     const samples = await getPrefillSamples(modelId);
     const fit = fitPrefillLinear(samples);
@@ -1603,24 +1931,21 @@ async function estimatePrefill(inputChars: number, modelId: string): Promise<Pre
         fit,
       };
     }
-  } catch {
-    // Sample fetch failed — fall through to ratio estimator
-  }
-
-  // 2. Ratio fallback — uses aggregate stats already in memory.
-  const stats = lifetime.modelStats.get(modelId);
-  if (stats && stats.ttftCalls >= 2 && stats.totalTtftMs > 0 && stats.totalPromptTokens > 0) {
-    const avgPromptTokens = stats.totalPromptTokens / stats.calls;
-    const avgTtftSec = (stats.totalTtftMs / stats.ttftCalls) / 1000;
-    if (avgTtftSec > 0) {
-      const prefillTokPerSec = avgPromptTokens / avgTtftSec;
-      return {
-        inputTokens,
-        estimatedSeconds: inputTokens / prefillTokPerSec,
-        basis: 'ratio',
-        prefillTokPerSec,
-      };
+    if (samples.length >= 2) {
+      const sumPrompt = samples.reduce((a, s) => a + s.promptTokens, 0);
+      const sumTtftMs = samples.reduce((a, s) => a + s.ttftMs, 0);
+      if (sumPrompt > 0 && sumTtftMs > 0) {
+        const prefillTokPerSec = sumPrompt / (sumTtftMs / 1000);
+        return {
+          inputTokens,
+          estimatedSeconds: inputTokens / prefillTokPerSec,
+          basis: 'ratio',
+          prefillTokPerSec,
+        };
+      }
     }
+  } catch {
+    // Sample fetch failed — fall through to the conservative default.
   }
 
   // 3. Conservative default for unknown model/hardware.
@@ -1739,9 +2064,7 @@ interface QualitySignal {
 function assessQuality(resp: StreamingResult, rawContent: string): QualitySignal {
   const hadThinkBlocks = /<think>/.test(rawContent);
   const estimated = !resp.usage && resp.content.length > 0;
-  const tokPerSec = resp.usage && resp.generationMs > 50
-    ? resp.usage.completion_tokens / (resp.generationMs / 1000)
-    : null;
+  const tokPerSec = computeTokPerSec(resp);
 
   return {
     truncated: resp.truncated,
@@ -1766,6 +2089,9 @@ function formatQualityLine(quality: QualitySignal): string {
   else if (quality.thinkBlocksStripped) flags.push('think-blocks-stripped');
   if (quality.estimatedTokens) flags.push('tokens-estimated');
   if (quality.finishReason === 'length') flags.push('hit-max-tokens');
+  // content_filter is a REFUSAL, not a truncation — the orchestrator should
+  // handle it differently (don't retry with a bigger budget). Surface distinctly.
+  if (quality.finishReason === 'content_filter') flags.push('CONTENT-FILTERED (model refused/blocked — not a length cut)');
   if (flags.length === 0) return '';
   return `Quality: ${flags.join(', ')}`;
 }
@@ -1838,6 +2164,12 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
     } else {
       parts.push(`${resp.usage.prompt_tokens}→${resp.usage.completion_tokens} tokens`);
     }
+    // Prefix-cache (KV reuse) hits — a strong "this delegation was nearly free"
+    // signal for the orchestrator when it re-sends shared context.
+    const cached = resp.usage.prompt_tokens_details?.cached_tokens;
+    if (typeof cached === 'number' && cached > 0) {
+      parts.push(`${cached} prompt tokens cached`);
+    }
   } else if (resp.content.length > 0) {
     const estTokens = Math.ceil(resp.content.length / 4);
     parts.push(`~${estTokens} tokens (estimated)`);
@@ -1853,7 +2185,8 @@ function formatFooter(resp: StreamingResult, extra?: string): string {
 
   const qualityLine = formatQualityLine(quality);
   if (qualityLine) parts.push(qualityLine);
-  if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
+  if (resp.streamError) parts.push(`⚠ UPSTREAM ERROR (partial result — backend reported: ${resp.streamError})`);
+  else if (resp.truncated) parts.push('⚠ TRUNCATED (soft timeout — partial result)');
 
   const benchmarkLine = isFirstBenchmarkedCall(resp.model, tokPerSec)
     ? `📊 First measured call on ${resp.model}: ${tokPerSec.toFixed(1)} tok/s${resp.ttftMs !== undefined ? `, ${resp.ttftMs}ms to first token` : ''} — use this to gauge whether to delegate longer tasks.`
@@ -1985,6 +2318,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id (e.g. "nvidia/nemotron-3-nano-30b-a3b:free" on OpenRouter, "qwen.qwen3-coder-30b-a3b-instruct" on LM Studio). When set, overrides automatic routing. Useful on providers with many models where auto-routing picks poorly.',
         },
+        ...SAMPLING_PROPS,
       },
       required: ['message'],
     },
@@ -2036,6 +2370,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...SAMPLING_PROPS,
       },
       required: ['instruction'],
     },
@@ -2079,6 +2414,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...SAMPLING_PROPS,
       },
       required: ['code', 'task'],
     },
@@ -2123,6 +2459,7 @@ const TOOLS = [
           type: 'string',
           description: 'Optional: pin to a specific model id. When set, overrides automatic routing.',
         },
+        ...SAMPLING_PROPS,
       },
       required: ['paths', 'task'],
     },
@@ -2270,7 +2607,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         totalTokensOffloaded: session.promptTokens + session.completionTokens,
       },
       perModel: modelStats,
-      endpoint: LM_BASE_URL,
+      endpoint: redactUrl(LM_BASE_URL),
     };
 
     return {
@@ -2288,7 +2625,11 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: EXPOSED_TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name } = request.params;
+  // `arguments` is optional in the MCP CallTool schema — a client may omit it
+  // entirely for a param-less tool (e.g. `stats` with no filter). Default to an
+  // empty object so handlers that destructure args never throw on `undefined`.
+  const args = request.params.arguments ?? {};
   const progressToken = request.params._meta?.progressToken;
 
   try {
@@ -2505,6 +2846,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const route = await routeToModel('chat', model);
+
+        const responseFormat: ResponseFormat | undefined = toResponseFormat(json_schema);
+
         const messages: ChatMessage[] = [];
         // Inject output constraint into system prompt if the model needs it.
         // Combine model-family hints with task-specific constraints.
@@ -2517,16 +2861,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (systemContent) messages.push({ role: 'system', content: systemContent });
         messages.push({ role: 'user', content: message });
 
-        const responseFormat: ResponseFormat | undefined = json_schema
-          ? { type: 'json_schema', json_schema: { name: json_schema.name, strict: json_schema.strict ?? true, schema: json_schema.schema } }
-          : undefined;
-
         const resp = await chatCompletionStreaming(messages, {
           temperature: temperature ?? route.hints.chatTemp,
           maxTokens: resolveTaskMaxTokens(taskKind, max_tokens),
           model: route.modelId,
           responseFormat,
           progressToken,
+          sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
         if (json_schema) {
@@ -2557,6 +2898,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
 
         const route = await routeToModel('analysis', model);
+
+        const responseFormat: ResponseFormat | undefined = toResponseFormat(json_schema);
+
         const messages: ChatMessage[] = [];
         const cTaskKind = detectTaskKind(instruction);
         const cTaskConstraint = getTaskOutputConstraint(cTaskKind);
@@ -2575,16 +2919,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
         messages.push({ role: 'user', content: instruction });
 
-        const responseFormat: ResponseFormat | undefined = json_schema
-          ? { type: 'json_schema', json_schema: { name: json_schema.name, strict: json_schema.strict ?? true, schema: json_schema.schema } }
-          : undefined;
-
         const resp = await chatCompletionStreaming(messages, {
           temperature: temperature ?? route.hints.chatTemp,
           maxTokens: resolveTaskMaxTokens(cTaskKind, max_tokens),
           model: route.modelId,
           responseFormat,
           progressToken,
+          sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
         if (json_schema) {
@@ -2643,6 +2984,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           maxTokens: resolveTaskMaxTokens(ctTaskKind, codeMaxTokens),
           model: route.modelId,
           progressToken,
+          sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
         const codeFooter = formatFooter(codeResp, lang);
@@ -2688,7 +3030,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // failures become inline error sections so the model can still reason about
         // the rest of the bundle.
         const reads = await Promise.allSettled(
-          paths.map(async (p) => ({ path: p, content: await readFile(p, 'utf8') })),
+          paths.map(async (p) => ({ path: p, content: await readGuardedFile(p) })),
         );
 
         const sections: string[] = [];
@@ -2737,7 +3079,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         // avoids the under-prediction a ratio-of-averages produces on inputs
         // much larger than the historical mean.
         const estimate = await estimatePrefill(combined.length, route.modelId);
-        const isConfidentEstimate = estimate.basis === 'linear-fit' || estimate.basis === 'ratio';
+        // A poor fit (low R² — e.g. bimodal samples straddling a backend
+        // restart with different perf settings) must not refuse the call: a
+        // false refusal is worse than a false-ok that the prefill keepalive
+        // and timeout machinery already handle.
+        const isConfidentEstimate =
+          (estimate.basis === 'linear-fit' && estimate.fit!.r2 >= 0.5) ||
+          estimate.basis === 'ratio';
         if (isConfidentEstimate && estimate.estimatedSeconds > PREFILL_REFUSE_THRESHOLD_SEC) {
           const estSec = Math.round(estimate.estimatedSeconds);
           const basisLine = estimate.basis === 'linear-fit'
@@ -2782,6 +3130,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           maxTokens: resolveTaskMaxTokens(ctfTaskKind, codeMaxTokens),
           model: route.modelId,
           progressToken,
+          sampling: extractSamplingParams(args as Record<string, unknown>),
         });
 
         const readSummary = successCount === paths.length
@@ -2805,7 +3154,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{
               type: 'text',
-              text: `Status: OFFLINE\nEndpoint: ${LM_BASE_URL}\n${reason}\n\nThe local LLM is not available right now. Do not attempt to delegate tasks to it.`,
+              text: `Status: OFFLINE\nEndpoint: ${redactUrl(LM_BASE_URL)}\n${reason}\n\nThe local LLM is not available right now. Do not attempt to delegate tasks to it.`,
             }],
           };
         }
@@ -2815,13 +3164,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return {
             content: [{
               type: 'text',
-              text: `Status: ONLINE (no model loaded)\nEndpoint: ${LM_BASE_URL}\nLatency: ${ms}ms\n\nThe server is running but no model is loaded. Ask the user to load a model in LM Studio.`,
+              text: `Status: ONLINE (no model loaded)\nEndpoint: ${redactUrl(LM_BASE_URL)}\nLatency: ${ms}ms\n\nThe server is running but no model is loaded. Ask the user to load a model in LM Studio.`,
             }],
           };
         }
 
         const loaded = models.filter((m) => m.state === 'loaded' || !m.state);
         const available = models.filter((m) => m.state === 'not-loaded');
+
+        // Models are downloaded but none is loaded (LM Studio with nothing
+        // active). `loaded` still includes state-less models from backends that
+        // don't report load state, so this fires only when every model is
+        // genuinely not-loaded. Report it distinctly instead of presenting an
+        // unloaded model as active — delegating to it would trigger an on-demand
+        // load on the first call and likely blow the client's request timeout.
+        if (loaded.length === 0) {
+          const names = (available.length > 0 ? available : models).map((m) => m.id).join(', ');
+          return {
+            content: [{
+              type: 'text',
+              text: `Status: ONLINE (no model loaded)\nEndpoint: ${redactUrl(LM_BASE_URL)}\nLatency: ${ms}ms\n\nThe server is running but no model is currently loaded. Downloaded models the user can load: ${names}\n\nDo not delegate tasks until a model is loaded.`,
+            }],
+          };
+        }
 
         const primary = loaded[0] || models[0];
         const ctx = getContextLength(primary);
@@ -2867,7 +3232,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         let text =
           `Status: ONLINE\n` +
-          `Endpoint: ${LM_BASE_URL} (${backendLabel})\n` +
+          `Endpoint: ${redactUrl(LM_BASE_URL)} (${backendLabel})\n` +
           `Connection latency: ${ms}ms (does not reflect inference speed)\n` +
           `Active model: ${primary.id}\n` +
           `Context window: ${ctx.toLocaleString()} tokens\n` +
@@ -2983,13 +3348,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ? `${data.usage.prompt_tokens} tokens embedded`
             : '';
 
+          // Round to 7 significant figures for transport. Embedding components
+          // are ~[-1, 1], so this is lossless for any similarity use but roughly
+          // halves the serialised size — which for high-dimension models
+          // (4k–8k dims) keeps the tool result from bloating the client context
+          // or exceeding its result-size limit. Dimensions are preserved.
+          const compact = (embedding as number[]).map((x) => Number(x.toPrecision(7)));
+
           return {
             content: [{
               type: 'text',
               text: JSON.stringify({
                 model: data.model,
                 dimensions: embedding.length,
-                embedding,
+                embedding: compact,
                 usage: usageInfo,
               }),
             }],
@@ -3007,7 +3379,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const lines: string[] = [];
         lines.push(`## Houtini LM stats`);
         lines.push('');
-        lines.push(`**Endpoint**: ${LM_BASE_URL} (${backendLabel})`);
+        lines.push(`**Endpoint**: ${redactUrl(LM_BASE_URL)} (${backendLabel})`);
         if (lifetime.firstSeenAt) {
           lines.push(`**First call on this workstation**: ${new Date(lifetime.firstSeenAt).toISOString().slice(0, 10)}`);
         }
@@ -3100,7 +3472,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  process.stderr.write(`Houtini LM server running (${LM_BASE_URL})\n`);
+  process.stderr.write(`Houtini LM server running (${redactUrl(LM_BASE_URL)})\n`);
 
   // Background: profile all available models via HF → SQLite cache
   // Non-blocking — server is already accepting requests

@@ -40,6 +40,8 @@ Your orchestrator's the architect. Your sidekick model's the drafter. Review eve
 
 ## Quick start
 
+> New to local models? See **[docs/GETTING-STARTED.md](./docs/GETTING-STARTED.md)** — installing LM Studio or a Docker endpoint, getting an OpenAI-compatible URL for houtini, what the smaller models are good at, and which models fit on 16/32/64/96/128 GB of VRAM.
+
 ### Claude Code
 
 ```bash
@@ -173,7 +175,7 @@ Available models (downloaded, not loaded):
     HuggingFace: text-generation, 12.9K downloads, Apache-2.0
 ```
 
-For models we know well - Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS - there's a curated profile built in with specific strengths and weaknesses. For everything else, the HuggingFace lookup fills the gaps. Cache refreshes every 7 days. Zero friction - `sql.js` is pure WASM, no native dependencies, no build tools needed.
+For models we know well - Qwen, Nemotron, Granite, LLaMA, GLM, GPT-OSS - there's a curated profile built in with specific strengths and weaknesses. For everything else, the HuggingFace lookup fills the gaps. Cache refreshes every 7 days. Zero friction - the cache uses `node:sqlite` (Node's built-in SQLite, so no third-party native dependency and no build tools) in WAL mode, which lets several houtini-lm processes share one cache safely. Requires Node ≥ 22.5.
 
 ## What gets offloaded
 
@@ -367,7 +369,7 @@ Example output:
 
 ```
 ## Houtini LM stats
-**Endpoint**: http://hopper:1234 (LM Studio)
+**Endpoint**: http://gpu-box:1234 (LM Studio)
 **First call on this workstation**: 2026-04-14
 
 ### Totals
@@ -440,7 +442,7 @@ The canonical way to verify an install and get an honest read on what the loaded
 npm run shakedown
 ```
 
-This runs [`shakedown.mjs`](./shakedown.mjs) — an end-to-end test that exercises all seven tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
+This runs [`shakedown.mjs`](./shakedown.mjs) — an end-to-end test that exercises seven of the eight tools (`discover` → `list_models` → `chat` → `custom_prompt` → `code_task` → `code_task_files` → `embed`; `stats` is not covered) and prints a summary table with real TTFT, tok/s, token counts, and reasoning-token split for each call. Takes under a minute on a decent rig.
 
 Sample output tail:
 
@@ -557,7 +559,7 @@ If the connection stalls (no new tokens for an extended period), you get a parti
 
 ```
 index.ts          Main MCP server - tools, streaming, session tracking
-model-cache.ts    SQLite-backed model profile cache (sql.js / WASM)
+model-cache.ts    SQLite-backed model profile cache (node:sqlite, WAL)
                   Auto-profiles models via HuggingFace API at startup
                   Persists to ~/.houtini-lm/model-cache.db
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { readFile, rm } from 'node:fs/promises';
+import { readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -160,6 +160,47 @@ try {
     assert.match(blocked.content[0].text, /outside HOUTINI_LM_ALLOWED_ROOTS/);
   }
   await codex.close();
+
+  const fileBounded = await connect('codex', {
+    HOUTINI_LM_MAX_FILE_MB: '1',
+  });
+  const oversizedPath = path.resolve('houtini-oversized-delegate-input.txt');
+  await writeFile(oversizedPath, 'x'.repeat(1024 * 1024 + 1), 'utf8');
+  try {
+    const oversizedFile = await fileBounded.callTool({
+      name: 'delegate',
+      arguments: {
+        task: 'Summarize this file',
+        paths: [oversizedPath],
+        kind: 'summarize',
+      },
+    });
+    assert.equal(oversizedFile.isError, true);
+    assert.match(oversizedFile.content[0].text, /refusing partial delegation/);
+    assert.match(oversizedFile.content[0].text, /over the 1 MB limit/);
+  } finally {
+    await rm(oversizedPath, { force: true });
+    await fileBounded.close();
+  }
+
+  const capped = await connect('codex');
+  scriptedResponses.push(
+    { content: 'this initial result is intentionally too long' },
+    { content: 'this compression result is still too long' },
+  );
+  const failedCompression = await capped.callTool({
+    name: 'delegate',
+    arguments: {
+      task: 'Summarize this input',
+      content: 'bounded input',
+      kind: 'summarize',
+      max_chars: 10,
+    },
+  });
+  assert.equal(failedCompression.isError, true);
+  assert.match(failedCompression.content[0].text, /compression could not satisfy max_chars=10/);
+  assert.doesNotMatch(failedCompression.content[0].text, /intentionally too long/);
+  await capped.close();
 
   const projectMode = await connect('codex', {
     HOUTINI_LM_DEEPSEEK_THINKING: 'enabled',

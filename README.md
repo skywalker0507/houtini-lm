@@ -261,6 +261,10 @@ Leave both unset and the router picks.
 
 Codex mode exposes one compact tool instead of the full legacy tool set. Codex decides what work is bounded, while the sidekick executes large-file first-pass review/summary, extraction, conversion, boilerplate, and drafts. Pass absolute `paths` whenever possible so file contents go directly to DeepSeek without first entering Codex context. DeepSeek thinking follows `HOUTINI_LM_DEEPSEEK_THINKING` and can be overridden per call; Codex still retains final decisions, edits, and verification.
 
+Every requested path must be a regular, readable file beneath an allowed root
+and within the configured file-size limit. The server refuses a partial batch
+rather than silently analysing only the files it could read.
+
 For DeepSeek thinking calls, `max_tokens` is treated as the desired visible
 answer budget. Houtini-LM adds a bounded hidden-reasoning allowance internally.
 If the model still returns reasoning only or hits the completion limit before a
@@ -270,7 +274,7 @@ complete answer, the request is retried once with thinking disabled. Optional
 `output_path` can write the final visible result beneath
 `HOUTINI_LM_ALLOWED_ROOTS`, returning only a short path/hash receipt to Codex.
 Its parent directory must already exist, and existing files require
-`overwrite: true`. This is bounded artifact output, not arbitrary file or
+`overwrite: true`; links and directories are rejected. This is bounded artifact output, not arbitrary file or
 command access; Houtini-LM still cannot execute shell commands.
 
 | Parameter | Required | Default | What it does |

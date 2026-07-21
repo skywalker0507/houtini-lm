@@ -35,7 +35,7 @@ import {
   type PromptHints,
 } from './model-cache.js';
 import { acquireInferenceLock } from './inference-lock.js';
-import { access, readFile, realpath, stat, writeFile } from 'node:fs/promises';
+import { lstat, readFile, realpath, stat, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { isAbsolute, basename, dirname, relative, resolve, sep } from 'node:path';
 
@@ -2727,8 +2727,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
 
           const reads = await Promise.allSettled(
-            paths.map(async (path) => ({ path, content: await readFile(path, 'utf8') })),
+            paths.map(async (path) => ({ path, content: await readGuardedFile(path) })),
           );
+          const readFailures = reads.flatMap((result, index) =>
+            result.status === 'rejected'
+              ? [`${paths[index]} (${result.reason instanceof Error ? result.reason.message : String(result.reason)})`]
+              : [],
+          );
+          if (readFailures.length > 0) {
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  'Error: refusing partial delegation because one or more requested files could not be read:\n' +
+                  readFailures.map((failure) => `  - ${failure}`).join('\n'),
+              }],
+              isError: true,
+            };
+          }
           for (const result of reads) {
             if (result.status === 'fulfilled') {
               inputSections.push(`=== FILE ${JSON.stringify(result.value.path)} ===\n${result.value.content}`);
@@ -2840,9 +2856,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             compressed.content &&
             !compressed.reasoningFallback &&
             !compressed.thinkStripFallback &&
-            !compressed.truncated
+            !compressed.truncated &&
+            compressed.content.length <= max_chars
           ) {
             resp = compressed;
+          } else {
+            return {
+              content: [{
+                type: 'text',
+                text:
+                  `Error: sidekick compression could not satisfy max_chars=${max_chars}; ` +
+                  'the overlong result was withheld from Codex context.',
+              }],
+              isError: true,
+            };
           }
         }
 
@@ -2853,9 +2880,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           let exists = false;
           try {
-            await access(output.path);
+            const existing = await lstat(output.path);
             exists = true;
-          } catch { /* new file */ }
+            if (!existing.isFile() || existing.isSymbolicLink()) {
+              return {
+                content: [{
+                  type: 'text',
+                  text: `Security: output_path must be a regular file, not a link or directory: ${output.path}`,
+                }],
+                isError: true,
+              };
+            }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+              return {
+                content: [{ type: 'text', text: `Error: could not inspect output_path: ${output.path}` }],
+                isError: true,
+              };
+            }
+          }
           if (exists && !overwrite) {
             return {
               content: [{
